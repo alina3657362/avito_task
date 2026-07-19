@@ -105,3 +105,20 @@ MAP@10 на validation: 0.174008
 | Гибридный baseline           | 0.6274 |    0.8739 |    0.9263 |
 | Logistic Regression reranker | 0.6411 |    0.9040 |    0.9440 |
 
+
+## Эксперимент № 6. Смешивание reranker и hybrid-score
+
+После обучения `LogisticRegression` reranker был проведён эксперимент со смешиванием его вероятности с исходным hybrid-score. Итоговый score рассчитывался по формуле:
+
+```python
+final_score = alpha * reranker_probability + (1 - alpha) * normalized_hybrid_score
+```
+
+Проверялись значения `alpha = 0.25, 0.5, 0.75, 1.0`. Лучший результат показал `alpha = 0.75`.
+
+| Метод               | MAP@10 | Recall@10 | Recall@20 |
+| ------------------- | -----: | --------: | --------: |
+| Hybrid baseline     | 0.6274 |    0.8739 |    0.9263 |
+| Blend, alpha = 0.75 | 0.6523 |    0.9085 |    0.9506 |
+
+
