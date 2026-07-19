@@ -121,4 +121,13 @@ final_score = alpha * reranker_probability + (1 - alpha) * normalized_hybrid_sco
 | Hybrid baseline     | 0.6274 |    0.8739 |    0.9263 |
 | Blend, alpha = 0.75 | 0.6523 |    0.9085 |    0.9506 |
 
+## Эксперимент № 7. Новый reranker
+
+Использую новый реранкер - bge-reranker-v2-m3
+
+Лучший параметр `beta = 0.25`. 
+
+```text
+MAP@10 на validation: 0.6726
+```
 

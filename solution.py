@@ -5,12 +5,17 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 from bs4 import BeautifulSoup
+from FlagEmbedding import FlagReranker
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+import io
+from contextlib import redirect_stderr, redirect_stdout
+from tqdm.auto import tqdm
 
 
 warnings.filterwarnings(
@@ -23,24 +28,28 @@ ARTICLES_PATH = Path("candidate_public/candidate_data/articles.f")
 CALIBRATION_PATH = Path("candidate_public/candidate_data/calibration.f")
 TEST_PATH = Path("candidate_public/candidate_data/test.f")
 ANSWER_PATH = Path("answer.csv")
-VALIDATION_RESULTS_PATH = Path("blend_validation_results.csv")
+VALIDATION_RESULTS_PATH = Path("bge_validation_results.csv")
 
 TOP_K = 10
 CANDIDATE_TOP_K = 50
+BGE_TOP_K = 30
 EVALUATION_KS = (10, 20)
 VALIDATION_SEEDS = [13, 21, 42, 77, 101]
 OOF_FOLDS = 5
 MISSING_RANK = 1000
-BLEND_ALPHAS = [0.25, 0.5, 0.75, 1.0]
+
+LOGREG_ALPHA = 0.75
+BGE_BETAS = [0.25, 0.5, 0.75, 1.0]
+BGE_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+BGE_BATCH_SIZE = 4
+BGE_MAX_LENGTH = 1024
 
 ARTICLE_WEIGHTS = (0.25, 0.30, 0.30, 0.15)
-
 QUERY_WORD_WEIGHT = 0.4
 QUERY_CHAR_WEIGHT = 0.6
 QUERY_NEIGHBORS = 30
 QUERY_SIMILARITY_POWER = 2.0
 QUERY_BLEND_WEIGHT = 0.5
-
 LOGISTIC_C = 1.0
 
 
@@ -65,6 +74,15 @@ def normalize_text(value: object, contains_html: bool = False) -> str:
     text = re.sub(r"[^a-zа-я0-9]+", " ", text)
 
     return re.sub(r"\s+", " ", text).strip()
+
+
+def prepare_reranker_text(title: object, body: object) -> str:
+    title = "" if pd.isna(title) else str(title)
+    body = clean_html(body)
+    title = re.sub(r"\s+", " ", html.unescape(title)).strip()
+    body = re.sub(r"\s+", " ", body).strip()
+
+    return f"Заголовок: {title}\nТекст статьи: {body}"
 
 
 def parse_ground_truth(value: object) -> set[int]:
@@ -129,6 +147,13 @@ class ArticleRetriever:
             article_id: index
             for index, article_id in enumerate(self.article_ids)
         }
+        self.reranker_texts = np.asarray(
+            [
+                prepare_reranker_text(row.title, row.body)
+                for row in articles.itertuples(index=False)
+            ],
+            dtype=object,
+        )
 
         titles = articles["title"].map(normalize_text)
         bodies = articles["body"].map(
@@ -168,7 +193,6 @@ class ArticleRetriever:
 
     def get_component_scores(self, query_text: str) -> dict[str, np.ndarray]:
         query = normalize_text(query_text)
-
         query_word = self.word_vectorizer.transform([query])
         query_char = self.char_vectorizer.transform([query])
 
@@ -200,14 +224,12 @@ class SimilarQueryRetriever:
     def __init__(self, calibration: pd.DataFrame, article_ids: np.ndarray):
         data = calibration.reset_index(drop=True)
         query_texts = data["query_text"].map(normalize_text)
-
         self.article_ids = article_ids
 
         article_id_to_index = {
             article_id: index
             for index, article_id in enumerate(article_ids)
         }
-
         self.ground_truth_indices = [
             np.asarray(
                 [
@@ -240,18 +262,12 @@ class SimilarQueryRetriever:
 
     def get_article_features(self, query_text: str) -> dict[str, np.ndarray]:
         query = normalize_text(query_text)
-
         query_word = self.word_vectorizer.transform([query])
         query_char = self.char_vectorizer.transform([query])
 
         word_scores = (query_word @ self.query_word_matrix.T).toarray().ravel()
         char_scores = (query_char @ self.query_char_matrix.T).toarray().ravel()
-
-        similarities = (
-            QUERY_WORD_WEIGHT * word_scores
-            + QUERY_CHAR_WEIGHT * char_scores
-        )
-
+        similarities = QUERY_WORD_WEIGHT * word_scores + QUERY_CHAR_WEIGHT * char_scores
         neighbor_indices = top_k_indices(similarities, QUERY_NEIGHBORS)
 
         article_count = len(self.article_ids)
@@ -259,18 +275,10 @@ class SimilarQueryRetriever:
         max_similarities = np.zeros(article_count, dtype=np.float32)
         similarity_sums = np.zeros(article_count, dtype=np.float32)
         voter_counts = np.zeros(article_count, dtype=np.float32)
-        best_neighbor_ranks = np.full(
-            article_count,
-            MISSING_RANK,
-            dtype=np.float32,
-        )
-
+        best_neighbor_ranks = np.full(article_count, MISSING_RANK, dtype=np.float32)
         total_weight = 0.0
 
-        for neighbor_rank, neighbor_index in enumerate(
-            neighbor_indices,
-            start=1,
-        ):
+        for neighbor_rank, neighbor_index in enumerate(neighbor_indices, start=1):
             similarity = float(similarities[neighbor_index])
 
             if similarity <= 0:
@@ -282,7 +290,6 @@ class SimilarQueryRetriever:
                 continue
 
             neighbor_weight = similarity ** QUERY_SIMILARITY_POWER
-
             vote_scores[article_indices] += neighbor_weight
             max_similarities[article_indices] = np.maximum(
                 max_similarities[article_indices],
@@ -294,7 +301,6 @@ class SimilarQueryRetriever:
                 best_neighbor_ranks[article_indices],
                 neighbor_rank,
             )
-
             total_weight += neighbor_weight
 
         if total_weight > 0:
@@ -314,6 +320,27 @@ class SimilarQueryRetriever:
             "voter_count": voter_counts,
             "best_neighbor_rank": best_neighbor_ranks,
         }
+
+
+class BgeCrossEncoder:
+    def __init__(self):
+        self.model = FlagReranker(
+            BGE_MODEL_NAME,
+            use_fp16=torch.cuda.is_available(),
+        )
+
+    def score(self, query_text: str, documents: np.ndarray) -> np.ndarray:
+        pairs = [[str(query_text), str(document)] for document in documents]
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            scores = self.model.compute_score(
+                pairs,
+                batch_size=BGE_BATCH_SIZE,
+                max_length=BGE_MAX_LENGTH,
+                normalize=True,
+            )
+
+        return np.atleast_1d(np.asarray(scores, dtype=np.float32))
 
 
 def get_article_ground_truth_stats(
@@ -344,7 +371,6 @@ def build_pair_features(
 
     article_scores = article_features["article"]
     query_scores = query_features["vote_score"]
-
     hybrid_scores = (
         (1.0 - QUERY_BLEND_WEIGHT) * article_scores
         + QUERY_BLEND_WEIGHT * query_scores
@@ -371,7 +397,6 @@ def build_pair_features(
 
     tfidf_candidate_mask = np.zeros(len(article_scores), dtype=np.float32)
     query_candidate_mask = np.zeros(len(article_scores), dtype=np.float32)
-
     tfidf_candidate_mask[tfidf_top_indices] = 1.0
     query_candidate_mask[query_top_indices] = 1.0
 
@@ -380,8 +405,7 @@ def build_pair_features(
 
     query_reciprocal_ranks = np.zeros(len(query_ranks), dtype=np.float32)
     query_reciprocal_ranks[valid_query_ranks] = (
-        1.0
-        / query_ranks[valid_query_ranks].astype(np.float32)
+        1.0 / query_ranks[valid_query_ranks].astype(np.float32)
     )
 
     rrf_scores = (
@@ -454,16 +478,12 @@ def build_oof_training_pairs(
 ) -> tuple[np.ndarray, np.ndarray]:
     data = calibration.reset_index(drop=True)
     groups = data["query_text"].map(normalize_text)
-
     splitter = GroupKFold(n_splits=OOF_FOLDS)
 
     feature_parts = []
     target_parts = []
 
-    for reference_indices, target_indices in splitter.split(
-        data,
-        groups=groups,
-    ):
+    for reference_indices, target_indices in splitter.split(data, groups=groups):
         reference = data.iloc[reference_indices].reset_index(drop=True)
         target = data.iloc[target_indices].reset_index(drop=True)
 
@@ -472,11 +492,9 @@ def build_oof_training_pairs(
             article_retriever.article_ids,
         )
 
-        article_gt_counts, article_gt_frequencies = (
-            get_article_ground_truth_stats(
-                reference,
-                article_retriever,
-            )
+        article_gt_counts, article_gt_frequencies = get_article_ground_truth_stats(
+            reference,
+            article_retriever,
         )
 
         for row in target.itertuples(index=False):
@@ -490,9 +508,7 @@ def build_oof_training_pairs(
                 article_gt_frequencies,
             )
 
-            candidate_article_ids = (
-                article_retriever.article_ids[candidate_indices]
-            )
+            candidate_article_ids = article_retriever.article_ids[candidate_indices]
 
             targets = np.asarray(
                 [
@@ -508,7 +524,7 @@ def build_oof_training_pairs(
     return np.vstack(feature_parts), np.concatenate(target_parts)
 
 
-def create_reranker(random_state: int) -> Pipeline:
+def create_logistic_reranker(random_state: int) -> Pipeline:
     return Pipeline(
         [
             ("scaler", StandardScaler()),
@@ -524,6 +540,72 @@ def create_reranker(random_state: int) -> Pipeline:
             ),
         ]
     )
+
+
+def get_current_scores(
+    logistic_reranker: Pipeline,
+    features: np.ndarray,
+    hybrid_scores: np.ndarray,
+    candidate_indices: np.ndarray,
+) -> np.ndarray:
+    logistic_scores = logistic_reranker.predict_proba(features)[:, 1]
+    normalized_hybrid_scores = minmax_normalize(hybrid_scores[candidate_indices])
+
+    return (
+        LOGREG_ALPHA * logistic_scores
+        + (1.0 - LOGREG_ALPHA) * normalized_hybrid_scores
+    )
+
+
+def get_bge_rerank_data(
+    query_text: str,
+    candidate_indices: np.ndarray,
+    current_scores: np.ndarray,
+    article_retriever: ArticleRetriever,
+    bge_reranker: BgeCrossEncoder,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    current_order = np.argsort(current_scores)[::-1]
+    bge_local_positions = current_order[:BGE_TOP_K]
+    bge_article_indices = candidate_indices[bge_local_positions]
+
+    bge_scores = bge_reranker.score(
+        query_text,
+        article_retriever.reranker_texts[bge_article_indices],
+    )
+
+    current_top_scores = minmax_normalize(current_scores[bge_local_positions])
+
+    return current_order, bge_local_positions, bge_scores, current_top_scores
+
+
+def build_bge_prediction(
+    candidate_indices: np.ndarray,
+    current_order: np.ndarray,
+    bge_local_positions: np.ndarray,
+    bge_scores: np.ndarray,
+    current_top_scores: np.ndarray,
+    article_retriever: ArticleRetriever,
+    beta: float,
+) -> list[int]:
+    final_top_scores = beta * bge_scores + (1.0 - beta) * current_top_scores
+    reranked_top_positions = bge_local_positions[np.argsort(final_top_scores)[::-1]]
+
+    top_position_set = set(bge_local_positions.tolist())
+
+    remaining_positions = [
+        position
+        for position in current_order
+        if position not in top_position_set
+    ]
+
+    final_positions = np.concatenate(
+        [
+            reranked_top_positions,
+            np.asarray(remaining_positions, dtype=int),
+        ]
+    )
+
+    return article_retriever.article_ids[candidate_indices[final_positions]].tolist()
 
 
 def create_metric_storage() -> dict[str, list[float]]:
@@ -544,17 +626,15 @@ def add_metrics(
     storage["recall_at_20"].append(recall_at_k(predicted, relevant, 20))
 
 
-def evaluate_blends(
+def evaluate_bge(
     article_retriever: ArticleRetriever,
     calibration: pd.DataFrame,
+    bge_reranker: BgeCrossEncoder,
 ) -> pd.DataFrame:
     results = []
 
     for split_number, seed in enumerate(VALIDATION_SEEDS, start=1):
-        print(
-            f"Валидация {split_number}/"
-            f"{len(VALIDATION_SEEDS)}..."
-        )
+        print(f"Валидация {split_number}/{len(VALIDATION_SEEDS)}...")
 
         train, validation = split_calibration(calibration, seed)
 
@@ -563,94 +643,105 @@ def evaluate_blends(
             article_retriever,
         )
 
-        reranker = create_reranker(seed)
-        reranker.fit(train_features, train_targets)
+        logistic_reranker = create_logistic_reranker(seed)
+        logistic_reranker.fit(train_features, train_targets)
 
         query_retriever = SimilarQueryRetriever(
             train,
             article_retriever.article_ids,
         )
 
-        article_gt_counts, article_gt_frequencies = (
-            get_article_ground_truth_stats(
-                train,
-                article_retriever,
-            )
+        article_gt_counts, article_gt_frequencies = get_article_ground_truth_stats(
+            train,
+            article_retriever,
         )
 
         method_metrics = {
-            "hybrid_baseline": create_metric_storage()
+            "current_blend": create_metric_storage(),
+            **{
+                f"bge_beta_{beta:.2f}": create_metric_storage()
+                for beta in BGE_BETAS
+            },
         }
 
-        method_metrics.update(
-            {
-                f"alpha_{alpha:.2f}": create_metric_storage()
-                for alpha in BLEND_ALPHAS
-            }
-        )
-
-        for row in validation.itertuples(index=False):
+        for row in tqdm(
+            validation.itertuples(index=False),
+            total=len(validation),
+            desc=f"Валидация {split_number}/{len(VALIDATION_SEEDS)}",
+            unit="запрос",
+            dynamic_ncols=True,
+        ):
             relevant = parse_ground_truth(row.ground_truth)
 
-            candidate_indices, features, hybrid_scores = (
-                build_pair_features(
-                    row.query_text,
-                    article_retriever,
-                    query_retriever,
-                    article_gt_counts,
-                    article_gt_frequencies,
-                )
+            candidate_indices, features, hybrid_scores = build_pair_features(
+                row.query_text,
+                article_retriever,
+                query_retriever,
+                article_gt_counts,
+                article_gt_frequencies,
             )
 
-            baseline_prediction = article_retriever.rank(
+            current_scores = get_current_scores(
+                logistic_reranker,
+                features,
                 hybrid_scores,
-                top_k=max(EVALUATION_KS),
+                candidate_indices,
             )
+
+            current_order = np.argsort(current_scores)[::-1]
+
+            current_prediction = article_retriever.article_ids[
+                candidate_indices[current_order]
+            ].tolist()
 
             add_metrics(
-                method_metrics["hybrid_baseline"],
-                baseline_prediction,
+                method_metrics["current_blend"],
+                current_prediction,
                 relevant,
             )
 
-            reranker_probabilities = reranker.predict_proba(
-                features
-            )[:, 1]
-
-            normalized_hybrid_scores = minmax_normalize(
-                hybrid_scores[candidate_indices]
+            (
+                current_order,
+                bge_local_positions,
+                bge_scores,
+                current_top_scores,
+            ) = get_bge_rerank_data(
+                row.query_text,
+                candidate_indices,
+                current_scores,
+                article_retriever,
+                bge_reranker,
             )
 
-            for alpha in BLEND_ALPHAS:
-                final_scores = (
-                    alpha * reranker_probabilities
-                    + (1.0 - alpha) * normalized_hybrid_scores
+            for beta in BGE_BETAS:
+                prediction = build_bge_prediction(
+                    candidate_indices,
+                    current_order,
+                    bge_local_positions,
+                    bge_scores,
+                    current_top_scores,
+                    article_retriever,
+                    beta,
                 )
 
-                order = np.argsort(final_scores)[::-1]
-
-                prediction = article_retriever.article_ids[
-                    candidate_indices[order]
-                ].tolist()
-
                 add_metrics(
-                    method_metrics[f"alpha_{alpha:.2f}"],
+                    method_metrics[f"bge_beta_{beta:.2f}"],
                     prediction,
                     relevant,
                 )
 
         for method, metrics in method_metrics.items():
-            alpha = (
+            beta = (
                 np.nan
-                if method == "hybrid_baseline"
-                else float(method.split("_")[1])
+                if method == "current_blend"
+                else float(method.rsplit("_", 1)[1])
             )
 
             results.append(
                 {
                     "seed": seed,
                     "method": method,
-                    "alpha": alpha,
+                    "beta": beta,
                     "map_at_10": np.mean(metrics["map_at_10"]),
                     "recall_at_10": np.mean(metrics["recall_at_10"]),
                     "recall_at_20": np.mean(metrics["recall_at_20"]),
@@ -665,11 +756,7 @@ def build_validation_summary(
 ) -> pd.DataFrame:
     return (
         validation_results
-        .groupby(
-            ["method", "alpha"],
-            dropna=False,
-            sort=False,
-        )
+        .groupby(["method", "beta"], dropna=False, sort=False)
         .agg(
             map_at_10_mean=("map_at_10", "mean"),
             map_at_10_std=("map_at_10", "std"),
@@ -677,27 +764,18 @@ def build_validation_summary(
             recall_at_20_mean=("recall_at_20", "mean"),
         )
         .reset_index()
-        .sort_values(
-            "map_at_10_mean",
-            ascending=False,
-        )
+        .sort_values("map_at_10_mean", ascending=False)
     )
 
 
-def print_validation_summary(
-    summary: pd.DataFrame,
-) -> None:
+def print_validation_summary(summary: pd.DataFrame) -> None:
     print("\nСредние результаты:")
 
     print(
         summary.to_string(
             index=False,
             formatters={
-                "alpha": lambda value: (
-                    "-"
-                    if pd.isna(value)
-                    else f"{value:.2f}"
-                ),
+                "beta": lambda value: "-" if pd.isna(value) else f"{value:.2f}",
                 "map_at_10_mean": "{:.6f}".format,
                 "map_at_10_std": "{:.6f}".format,
                 "recall_at_10_mean": "{:.6f}".format,
@@ -707,72 +785,76 @@ def print_validation_summary(
     )
 
 
-def select_best_alpha(
-    validation_results: pd.DataFrame,
-) -> float:
-    alpha_scores = (
+def select_best_beta(validation_results: pd.DataFrame) -> float:
+    beta_scores = (
         validation_results
-        .dropna(subset=["alpha"])
-        .groupby("alpha")["map_at_10"]
+        .dropna(subset=["beta"])
+        .groupby("beta")["map_at_10"]
         .mean()
     )
 
-    return float(alpha_scores.idxmax())
+    return float(beta_scores.idxmax())
 
 
 def build_answers(
     test: pd.DataFrame,
     article_retriever: ArticleRetriever,
     query_retriever: SimilarQueryRetriever,
-    reranker: Pipeline,
+    logistic_reranker: Pipeline,
+    bge_reranker: BgeCrossEncoder,
     article_gt_counts: np.ndarray,
     article_gt_frequencies: np.ndarray,
-    alpha: float,
+    beta: float,
 ) -> pd.DataFrame:
     answers = []
 
-    for row_number, query_text in enumerate(
-        test["query_text"],
-        start=1,
-    ):
-        candidate_indices, features, hybrid_scores = (
-            build_pair_features(
-                query_text,
-                article_retriever,
-                query_retriever,
-                article_gt_counts,
-                article_gt_frequencies,
-            )
+    for query_text in tqdm(
+            test["query_text"],
+            total=len(test),
+            desc="Формирование answer.csv",
+            unit="запрос",
+            dynamic_ncols=True,
+        ):
+        candidate_indices, features, hybrid_scores = build_pair_features(
+            query_text,
+            article_retriever,
+            query_retriever,
+            article_gt_counts,
+            article_gt_frequencies,
         )
 
-        reranker_probabilities = reranker.predict_proba(
-            features
-        )[:, 1]
-
-        normalized_hybrid_scores = minmax_normalize(
-            hybrid_scores[candidate_indices]
+        current_scores = get_current_scores(
+            logistic_reranker,
+            features,
+            hybrid_scores,
+            candidate_indices,
         )
 
-        final_scores = (
-            alpha * reranker_probabilities
-            + (1.0 - alpha) * normalized_hybrid_scores
+        (
+            current_order,
+            bge_local_positions,
+            bge_scores,
+            current_top_scores,
+        ) = get_bge_rerank_data(
+            query_text,
+            candidate_indices,
+            current_scores,
+            article_retriever,
+            bge_reranker,
         )
 
-        order = np.argsort(final_scores)[::-1]
+        prediction = build_bge_prediction(
+            candidate_indices,
+            current_order,
+            bge_local_positions,
+            bge_scores,
+            current_top_scores,
+            article_retriever,
+            beta,
+        )[:TOP_K]
 
-        prediction = article_retriever.article_ids[
-            candidate_indices[order[:TOP_K]]
-        ]
+        answers.append(" ".join(map(str, prediction)))
 
-        answers.append(
-            " ".join(map(str, prediction))
-        )
-
-        if row_number % 100 == 0:
-            print(
-                "Обработано тестовых запросов: "
-                f"{row_number}/{len(test)}"
-            )
 
     answer = test[["query_id"]].copy()
     answer["answer"] = answers
@@ -791,12 +873,16 @@ def main() -> None:
         f"{len(test)} test-запросов"
     )
 
-    print("Строим TF-IDF-представления статей...")
+    print("Строим TF-IDF-представления...")
     article_retriever = ArticleRetriever(articles)
 
-    validation_results = evaluate_blends(
+    print(f"Загружаем {BGE_MODEL_NAME}...")
+    bge_reranker = BgeCrossEncoder()
+
+    validation_results = evaluate_bge(
         article_retriever,
         calibration,
+        bge_reranker,
     )
 
     validation_results.to_csv(
@@ -804,46 +890,30 @@ def main() -> None:
         index=False,
     )
 
-    summary = build_validation_summary(
-        validation_results
-    )
-
+    summary = build_validation_summary(validation_results)
     print_validation_summary(summary)
 
-    best_alpha = select_best_alpha(
-        validation_results
+    best_beta = select_best_beta(validation_results)
+    print(f"\nЛучший beta: {best_beta:.2f}")
+
+    print("Обучаем финальный Logistic Regression reranker...")
+
+    train_features, train_targets = build_oof_training_pairs(
+        calibration,
+        article_retriever,
     )
 
-    print(f"\nЛучший alpha: {best_alpha:.2f}")
-
-    print("Обучаем финальный reranker...")
-
-    train_features, train_targets = (
-        build_oof_training_pairs(
-            calibration,
-            article_retriever,
-        )
-    )
-
-    final_reranker = create_reranker(
-        random_state=42
-    )
-
-    final_reranker.fit(
-        train_features,
-        train_targets,
-    )
+    final_logistic_reranker = create_logistic_reranker(random_state=42)
+    final_logistic_reranker.fit(train_features, train_targets)
 
     final_query_retriever = SimilarQueryRetriever(
         calibration,
         article_retriever.article_ids,
     )
 
-    article_gt_counts, article_gt_frequencies = (
-        get_article_ground_truth_stats(
-            calibration,
-            article_retriever,
-        )
+    article_gt_counts, article_gt_frequencies = get_article_ground_truth_stats(
+        calibration,
+        article_retriever,
     )
 
     print("Строим answer.csv...")
@@ -852,16 +922,14 @@ def main() -> None:
         test,
         article_retriever,
         final_query_retriever,
-        final_reranker,
+        final_logistic_reranker,
+        bge_reranker,
         article_gt_counts,
         article_gt_frequencies,
-        best_alpha,
+        best_beta,
     )
 
-    answer.to_csv(
-        ANSWER_PATH,
-        index=False,
-    )
+    answer.to_csv(ANSWER_PATH, index=False)
 
     print(f"Готово: {ANSWER_PATH.resolve()}")
 
